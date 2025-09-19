@@ -1,3 +1,8 @@
+# This code reads a list of polygons, and it calculates the percentage change for
+# NDTI between max and min across a range of years (2018-2019 for testing). In
+# addition, it'll fit a logistic regression to the data to determine if the calculated
+# NDTI change can predict the tillage type (till vs. no till)
+
 # --- STEP 1. Setup ---
 # Core libraries
 library(zoo)
@@ -426,9 +431,9 @@ process_ndti_for_site <- function(selected_anchor) {
     max_before_min_date<- NA
   }
   
-  # calculate the Percentage Change (aka "drop")
+  # calculate the Percentage Change
   ratio <- if (!is.na(max_before_min) && max_before_min != 0) {
-    (max_before_min - min_val) / max_before_min
+    (max_before_min - min_val) / max_before_min * 100
   } else NA
   
   # Keep any extra info, e.g. treatment
@@ -440,15 +445,16 @@ process_ndti_for_site <- function(selected_anchor) {
     min_ndti_date       = min_date,
     max_before_min      = max_before_min,
     max_before_min_date = max_before_min_date,
-    ndti_smooth_drop    = ratio
+    percentage_change   = ratio
   )
 }
   
   
 
-anchor_num <- 11
-selected_anchor <- anchors[anchor_num, ]
-process_ndti_for_site(selected_anchor)
+# Testing
+# anchor_num <- 11
+# selected_anchor <- anchors[anchor_num, ]
+# process_ndti_for_site(selected_anchor)
 
 
 
@@ -457,31 +463,103 @@ summary_table <- anchors %>%
   split(.$id) %>%
   map_dfr(process_ndti_for_site)
 
+# summary(summary_table)
+
 # save the result
 # write.csv(summary_table, "/projectnb/dietzelab/XinyuanJi/ndti_all_sites_summary.csv", row.names = FALSE)
 
+
+
+# Plot Treatment Control vs. Percentage_change
+# Create a new till type column
+summary_table <- summary_table %>%
+  mutate(
+    till_type = case_when(
+      grepl("(?i)no[ _-]*till", Treatment_Control) ~ "no till",
+      grepl("(?i)till", Treatment_Control) ~ "till",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Plot the data
+ggplot(summary_table, aes(x = percentage_change, y = till_type, color = till_type)) +
+  geom_jitter(width = 0, height = 0.1, size = 2, alpha = 0.7) +
+  labs(x = "Percentage Change", y = "Treatment", title = "Till vs No-Till") +
+  scale_color_manual(values = c("no till" = "blue", "till" = "red")) +
+  theme_minimal()
+
+
+
+# Logistic regression
+# Filter out NA values and set the factor levels explicitly
+summary_table_filtered <- summary_table %>%
+  filter(!is.na(till_type)) %>%
+  mutate(
+    till_type_factor = factor(till_type, levels = c("no till", "till")),
+    till_type_numeric = as.numeric(till_type_factor) - 1
+  )
+
+
+
+# Set up the base plot with the continuous y-axis
+ggplot(summary_table_filtered, aes(x = percentage_change, y = till_type_numeric)) +
   
+  # Layer 1: raw data points
+  # Use the continuous numeric y-axis for jittering
+  geom_jitter(
+    aes(color = till_type_factor),
+    height = 0.1,  # you might need to adjust this value
+    alpha = 0.7
+  ) +
   
-# ndti_df$mean_ndti_filled <- na.approx(ndti_df$mean_ndti, x = ndti_df$date, na.rm = FALSE)
-# w <- 4
-# k <- rep(1/w, w)
-# ndti_df$smoothed <- as.numeric(stats::filter(ndti_df$mean_ndti_filled, k, sides = 2))
-# 
-# ndti_smooth <- ndti_df[!is.na(ndti_df$smoothed), ]
-# min_row     <- ndti_smooth[which.min(ndti_smooth$smoothed), ]
-# min_val     <- min_row$smoothed
-# min_date    <- min_row$date
-# before_min  <- ndti_smooth[ndti_smooth$date < min_date, ]
-# 
-# if (nrow(before_min) > 0 && !all(is.na(before_min$smoothed))) {
-#   max_before_min_row <- before_min[which.max(before_min$smoothed), ]
-#   max_before_min     <- max_before_min_row$smoothed
-#   max_before_min_date<- max_before_min_row$date
-# } else {
-#   max_before_min     <- NA
-#   max_before_min_date<- NA
-# }
-# ratio <- if (!is.na(max_before_min) && max_before_min != 0) {
-#   (max_before_min - min_val) / max_before_min
-# } else NA
+  # Layer 2: logistic regression curve
+  stat_smooth(
+    method = "glm",
+    method.args = list(family = "binomial"),
+    se = TRUE,  # confidence interval
+    color = "black",
+    size = 1.2
+  ) +
+  
+  # labels
+  labs(
+    title = "Logistic Regression: Till Type vs. Percentage Change",
+    x = "Percentage Change",
+    y = "Predicted Probability of 'Till'",
+    color = "Till Type"
+  ) +
+  
+  scale_color_manual(values = c("no till" = "blue", "till" = "red")) +
+  
+  # Set the breaks and labels for the numeric y-axis to be more meaningful
+  scale_y_continuous(
+    limits = c(-0.1, 1.1),
+    breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1),
+    labels = c("No Till", "0.2", "0.4", "0.6", "0.8", "Till")
+  ) +
+  coord_cartesian(xlim = c(20, 70))
+  theme_minimal()
+
+
+
+# Fit the logistic regression model
+logistic_model <- glm(
+  till_type_factor ~ percentage_change,
+  data = summary_table_filtered,
+  family = "binomial"
+)
+
+# Print a summary of the model
+cat("\n\n--- Logistic Regression Model Summary ---\n")
+print(summary(logistic_model))
+
+# Calculate and print the odds ratio for easier interpretation
+coef_pc <- coef(logistic_model)["percentage_change"]
+odds_ratio_pc <- exp(coef_pc)
+
+cat("\n\n--- Interpretation ---\n")
+cat("Odds Ratio for percentage_change:", round(odds_ratio_pc, 3), "\n")
+cat("Interpretation: For every 1-unit increase in 'percentage_change',\n")
+cat("the odds of a field being Tilled are multiplied by", round(odds_ratio_pc, 3), ".\n")
+
 
