@@ -12,9 +12,6 @@ handlers("txtprogressbar")
 
 # BLOCK 1: EXTRACT LOCATIONS
 
-# This code takes in a list of points on the map based on lon/lat. It finds the
-# polygons that each point lies within and return a list of the polygons' location
-
 # Step 1: Load the shapefile (polygons)
 polygons <- st_read("~/projectnb/ccmmf/LandIQ_data/LandIQ_shapefiles/Spatial_Joins/all_crops_2018-2023_same_uids_try5.shp")
 
@@ -22,7 +19,7 @@ polygons <- st_read("~/projectnb/ccmmf/LandIQ_data/LandIQ_shapefiles/Spatial_Joi
 points_df <- read_csv("~/projectnb/XinyuanJi/design_points.csv")
 
 # Step 3: Convert points to sf object
-# Ensure the CSV has 'lon' and 'lat' columns
+# Make sure that the CSV has 'lon' and 'lat' columns
 points_sf <- st_as_sf(points_df, coords = c("lon", "lat"), crs = 4326)
 
 # Step 4: Match CRS between polygons and points
@@ -227,9 +224,11 @@ all_phenology <- map_dfr(1:nrow(anchors_tiles), function(i) {
   hls_tile_files <- hls_files[str_detect(basename(hls_files), fixed(tileID))]
   
   df <- extract_phenology(hls_tile_files, roi_vect_wgs)
-  df$site_id <- anchors_tiles$id[i]
-  df$site_name <- anchors_tiles$site_name[i]
-  df
+  df <- df %>%
+    mutate(
+      id = anchors_tiles$id[i],          # create id column
+      site_name = anchors_tiles$site_name[i]
+    )
 })
 
 summary(all_phenology)
@@ -331,8 +330,8 @@ phenology_dates <- all_phenology %>%
   mutate(
     greenup_date   = as.Date(greenup_date),
     greendown_date = as.Date(greendown_date)
-  ) %>%
-  rename(id = site_id)
+  )#  %>%
+#   rename(id = site_id)
 
 
 
@@ -848,16 +847,47 @@ process_ndti_for_site <- function(selected_anchor) {
       gu <- yrdata$greenup_date[1]
       gd <- yrdata$greendown_date[1]
       
+      # define seasons
+      # define seasons
       growing <- yrdata %>% filter(date >= gu & date <= gd)
       fallow  <- yrdata %>% filter(date < gu | date > gd)
       
+      message("Year: ", yrdata$year[1])
+      message("NDTI points total: ", nrow(yrdata))
+      message("Growing season points: ", nrow(growing))
+      message("Fallow season points: ", nrow(fallow))
+      
+      # find the minimum NDTI in fallow season
+      min_ndti_fallow <- if (nrow(fallow) > 0) min(fallow$smoothed, na.rm = TRUE) else NA_real_
+      min_ndti_fallow_date <- if (!is.na(min_ndti_fallow)) {
+        fallow$date[which.min(fallow$smoothed)]
+      } else {
+        as.Date(NA)
+      }
+      
+      # find max BEFORE the min_ndti date (within fallow season)
+      max_before_min <- NA_real_
+      max_before_min_date <- as.Date(NA)
+      
+      if (!is.na(min_ndti_fallow_date)) {
+        fallow_before <- fallow %>% filter(date < min_ndti_fallow_date)
+        
+        if (nrow(fallow_before) > 0) {
+          max_before_min <- max(fallow_before$smoothed, na.rm = TRUE)
+          max_before_min_date <- fallow_before$date[which.max(fallow_before$smoothed)]
+        }
+      }
+      
       tibble(
-        max_ndti_growing = if (nrow(growing)>0) max(growing$smoothed, na.rm = TRUE) else NA_real_,
-        max_ndti_growing_date = if (nrow(growing)>0) growing$date[which.max(growing$smoothed)] else as.Date(NA),
-        min_ndti_fallow = if (nrow(fallow)>0) min(fallow$smoothed, na.rm = TRUE) else NA_real_,
-        min_ndti_fallow_date = if (nrow(fallow)>0) fallow$date[which.min(fallow$smoothed)] else as.Date(NA),
-        ndti_range = if (!is.na(max_ndti_growing) && !is.na(min_ndti_fallow)) max_ndti_growing - min_ndti_fallow else NA_real_
+        max_ndti_growing       = max_before_min,
+        max_ndti_growing_date  = max_before_min_date,
+        min_ndti_fallow        = min_ndti_fallow,
+        min_ndti_fallow_date   = min_ndti_fallow_date,
+        ndti_range             = if (!is.na(max_before_min) && !is.na(min_ndti_fallow))
+          max_before_min - min_ndti_fallow
+        else NA_real_
       )
+      
     }) %>%
     ungroup() %>%
     mutate(
@@ -904,6 +934,16 @@ process_ndti_for_site <- function(selected_anchor) {
 
 
 # Testing
+# test_summary <- map_dfr(10:15, function(i) {
+#   process_ndti_for_site(anchors[i, ])
+# })
+# 
+# test_summary
+
+
+
+
+
 # valid_anchor <- anchors %>%
 #   mutate(id = as.character(id)) %>%
 #   filter(id == "1024636")
@@ -929,3 +969,4 @@ summary(summary_table)
 
 # save the result
 # write.csv(summary_table_raw, "/projectnb/dietzelab/XinyuanJi/ndti_design_points_summary(test).csv", row.names = FALSE)
+
