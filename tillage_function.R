@@ -1,6 +1,6 @@
 # Library
 librarian::shelf(
-  data.table, dplyr, tidyr, zoo, readr, ggplot2, arrow, progressr
+  data.table, dplyr, tidyr, zoo, readr, ggplot2, arrow, progressr, terra
 )
 
 # parallel & progress
@@ -12,10 +12,11 @@ phenology <- fread("/projectnb/dietzelab/XinyuanJi/chosen_pairs_subsample_n=400_
 
 tillage_metrics <- function(ndti_table, phenology_table) {
   
-  # 1. Use as_tibble or copy to avoid data.table reference issues
-  ndti_work <- as_tibble(ndti_table) %>% mutate(date = as.Date(date))
+  # 1. Data Prep
+  ndti_work <- as_tibble(ndti_table) %>% 
+    mutate(date = as.Date(date),
+           ss = ifelse(!is.na(n_valid) & n_valid > 0, n_valid * (ndti_sd^2), 0))
   
-  # Helper: Julian converter
   convert_julian <- function(julian_days, year) {
     as.Date(ceiling(julian_days) - 1, origin = paste0(year, "-01-01"))
   }
@@ -31,14 +32,14 @@ tillage_metrics <- function(ndti_table, phenology_table) {
     arrange(parcel_id, date) %>%
     group_by(parcel_id, year, PFT, season) %>%
     complete(date = seq.Date(min(date), max(date), by = "day")) %>%
-    fill(OGMn_date, OGI_date, .direction = "downup") %>%
+    fill(OGMn_date, OGI_date, .direction = "downup") %>% 
     mutate(
       mean_ndti_filled = zoo::na.approx(ndti_mean, x = date, na.rm = FALSE),
       smoothed = as.numeric(stats::filter(mean_ndti_filled, rep(1/4, 4), sides = 2))
     ) %>%
     ungroup()
   
-  # 3. Fallow periods
+  # 3. Base Metrics Identification
   fallow_periods <- pheno_date %>%
     arrange(parcel_id, OGI_date) %>%
     group_by(parcel_id) %>%
@@ -46,53 +47,100 @@ tillage_metrics <- function(ndti_table, phenology_table) {
     filter(!is.na(fallow_end)) %>%
     ungroup()
   
-  final_output <- ndti_smooth %>%
+  base_metrics <- ndti_smooth %>%
     inner_join(fallow_periods, by = "parcel_id") %>%
     filter(date >= fallow_start & date <= fallow_end) %>%
     group_by(parcel_id, fallow_start) %>%
     summarize(
-      # 1. Define the index first so it is available for all following lines
-      min_idx            = which.min(smoothed),
-      
-      # 2. Now you can safely use min_idx
-      year               = first(year.y),
-      PFT                = first(PFT),
-      season             = first(season.y),
-      OGMn_date          = first(fallow_start),
-      
-      ndti_on_OGMn       = smoothed[date == first(fallow_start)],
-      n_valid_on_OGMn    = n_valid[date == first(fallow_start)],
-      ndti_sd_on_OGMn    = ndti_sd[date == first(fallow_start)],
-      
-      minNDTI_date       = date[min_idx],
-      ndti_on_minNDTI    = smoothed[min_idx],
-      n_valid_on_minNDTI = n_valid[min_idx],
-      ndti_sd_on_minNDTI = ndti_sd[min_idx],
-      
+      min_idx          = which.min(smoothed),
+      minNDTI_date     = date[min_idx],
+      ndti_on_minNDTI  = smoothed[min_idx],
+      max_pre_idx      = which.max(ifelse(date <= minNDTI_date, smoothed, -Inf)),
+      maxNDTI_pre_date = date[max_pre_idx],
+      maxNDTI_pre_min  = smoothed[max_pre_idx],
+      ndti_pct_change  = ((maxNDTI_pre_min - ndti_on_minNDTI) / maxNDTI_pre_min) * 100,
+      year = first(year.y), PFT = first(PFT), season = first(season.y),
+      OGMn_date = first(fallow_start),
       .groups = "drop"
     )
   
-  # 5. External helper to find neighbors (defined OUTSIDE the pipe)
-  get_neighbors_vec <- function(p_id, m_date) {
-    valid_data <- ndti_smooth %>% 
-      filter(parcel_id == p_id, !is.na(n_valid), n_valid > 0)
+  # 4. Final Robust Helper
+  get_metric_details <- function(p_id, target_date, limit_date = NULL) {
+    # 1. Get ALL data for this parcel (including the 0/NA n_valid days)
+    all_days <- ndti_smooth %>% 
+      filter(parcel_id == p_id) %>%
+      distinct(date, .keep_all = TRUE)
     
-    prev <- valid_data %>% filter(date < m_date) %>% slice_max(date, n = 1, with_ties = FALSE)
-    foll <- valid_data %>% filter(date > m_date) %>% slice_min(date, n = 1, with_ties = FALSE)
+    # 2. Get ONLY valid observation days for neighbor searching
+    relevant <- all_days %>% filter(n_valid > 0)
     
-    tibble(
-      valid_date_before_min_ndti = if(nrow(prev) > 0) prev$date else as.Date(NA),
-      prev_n_valid = if(nrow(prev) > 0) prev$n_valid else NA,
-      valid_date_after_min_ndti = if(nrow(foll) > 0) foll$date else as.Date(NA),
-      foll_n_valid = if(nrow(foll) > 0) foll$n_valid else NA
+    # Identify the specific target row
+    target_row <- all_days %>% filter(date == target_date)
+    
+    # Neighbors for pooling
+    prev <- relevant %>% filter(date < target_date) %>% slice_max(date, n = 1, with_ties = FALSE)
+    foll <- relevant %>% filter(date > target_date) %>% slice_min(date, n = 1, with_ties = FALSE)
+    
+    if (!is.null(limit_date)) {
+      prev <- prev %>% filter(date >= limit_date)
+      foll <- foll %>% filter(date >= limit_date)
+    }
+    
+    # LOGIC CHANGE: 
+    # n_on_day: The actual n_valid from the input data for that specific date
+    n_on_day <- if(nrow(target_row) > 0) coalesce(target_row$n_valid[1], 0) else 0
+    
+    # Calculate SD (Direct if n > 0, Pooled if n == 0)
+    if (n_on_day > 0) {
+      sd_val <- target_row$ndti_sd[1]
+    } else {
+      comb <- bind_rows(prev, foll)
+      sd_val <- if(nrow(comb) > 0 && sum(comb$n_valid, na.rm=TRUE) > 0) {
+        sqrt(sum(comb$ss) / sum(comb$n_valid))
+      } else {
+        NA_real_
+      }
+    }
+    
+    list(
+      sd       = sd_val, 
+      n_total  = n_on_day, # This will now show 0 for interpolated days
+      d_before = if(nrow(prev) > 0) prev$date else as.Date(NA),
+      n_before = if(nrow(prev) > 0) prev$n_valid else NA_real_,
+      d_after  = if(nrow(foll) > 0) foll$date else as.Date(NA),
+      n_after  = if(nrow(foll) > 0) foll$n_valid else NA_real_
     )
   }
   
-  # 6. Apply search safely
-  neighbors <- purrr::map2_dfr(final_output$parcel_id, final_output$minNDTI_date, get_neighbors_vec)
-  
-  final_output <- bind_cols(final_output, neighbors) %>%
-    select(-fallow_start, -min_idx)
+  # 5. Assembly
+  final_output <- base_metrics %>%
+    rowwise() %>%
+    mutate(
+      res_max = list(get_metric_details(parcel_id, maxNDTI_pre_date, OGMn_date)),
+      res_min = list(get_metric_details(parcel_id, minNDTI_date))
+    ) %>%
+    ungroup() %>%
+    # unnest_wider creates columns like res_max_sd, res_max_n_total, etc.
+    unnest_wider(res_max, names_sep = "_") %>%
+    unnest_wider(res_min, names_sep = "_") %>%
+    select(
+      parcel_id, year, PFT, season,
+      OGMn_date,
+      # Max NDTI
+      max_date = maxNDTI_pre_date, max_ndti = maxNDTI_pre_min, 
+      max_n_valid = res_max_n_total, max_sd = res_max_sd,
+      # Min NDTI
+      min_date = minNDTI_date, min_ndti = ndti_on_minNDTI, 
+      min_n_valid = res_min_n_total, min_sd = res_min_sd,
+      # Pct Change
+      ndti_pct_change,
+      # Validation Max
+      max_val_date_before = res_max_d_before, max_val_n_before = res_max_n_before,
+      max_val_date_after  = res_max_d_after,  max_val_n_after  = res_max_n_after,
+      # Validation Min
+      min_val_date_before = res_min_d_before, min_val_n_before = res_min_n_before,
+      min_val_date_after  = res_min_d_after,  min_val_n_after  = res_min_n_after
+    )
   
   return(final_output)
 }
@@ -106,6 +154,8 @@ tillage_metrics <- function(ndti_table, phenology_table) {
 # 
 # ndti  <- rbindlist(lapply(ndti_files, read_parquet),  use.names = TRUE, fill = TRUE)
 # mslsp <- rbindlist(lapply(mslsp_files, read_parquet), use.names = TRUE, fill = TRUE)
+# 
+# colnames(ndti)
 # 
 # 
 # 
@@ -177,7 +227,6 @@ example <- tillage_metrics(ndti,phenology)
 head(example)
 
 
-
 # Save the result
 # write_csv(example, "/projectnb/dietzelab/XinyuanJi/tillage_test.csv", na = "NA")
 
@@ -201,27 +250,27 @@ head(example)
 # target_parcel <- 1149047
 # target_year   <- 2022
 # 
-# annual_data <- ndti_smooth %>% 
+# annual_data <- ndti_smooth %>%
 #   filter(parcel_id == target_parcel, year == target_year)
 # 
 # # 2. Get PFT for the title
-# plot_pft <- unique(annual_data$PFT)[1] 
+# plot_pft <- unique(annual_data$PFT)[1]
 # 
 # # 3. Get the specific dates for the vertical lines
 # # We filter the final_output for the relevant parcel and year
-# line_dates <- final_output %>% 
+# line_dates <- final_output %>%
 #   filter(parcel_id == target_parcel, year == target_year)
 # 
 # # 4. Create the plot
 # ggplot(annual_data, aes(x = date, y = smoothed)) +
 #   geom_line(color = "darkgreen", size = 1) +
 #   # Vertical line 1: OGMn date (Red)
-#   geom_vline(data = line_dates, aes(xintercept = OGMn_date), 
+#   geom_vline(data = line_dates, aes(xintercept = OGMn_date),
 #              color = "red", linetype = "dashed", size = 0.8) +
-#   # Vertical line 2: Next OGI date (Green) 
-#   # Note: You may need to join the fallow_end back to final_output 
+#   # Vertical line 2: Next OGI date (Green)
+#   # Note: You may need to join the fallow_end back to final_output
 #   # or pull from fallow_periods if 'next OGI' isn't explicitly in final_output
-#   geom_vline(data = line_dates, aes(xintercept = minNDTI_date), 
+#   geom_vline(data = line_dates, aes(xintercept = minNDTI_date),
 #              color = "blue", linetype = "dotted", size = 0.8) +
 #   # Vertical line 3: min_ndti date (Blue)
 #   labs(
@@ -231,4 +280,7 @@ head(example)
 #     y = "Smoothed NDTI"
 #   ) +
 #   theme_minimal()
+
+
+
 
