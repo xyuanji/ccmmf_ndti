@@ -1,14 +1,14 @@
 # Library
 librarian::shelf(
-  data.table, dplyr, tidyr, zoo, readr, ggplot2, arrow, progressr, terra
+  data.table, dplyr, tidyr, zoo, readr, ggplot2, arrow, progressr, terra, ggplot2
 )
 
 # parallel & progress
 terraOptions(threads = 16)
 handlers("txtprogressbar")
 
-ndti  <- fread("/projectnb/dietzelab/XinyuanJi/ndti_subsample_n=400_2018-2023.csv")
-phenology <- fread("/projectnb/dietzelab/XinyuanJi/chosen_pairs_subsample_n=400_2018-2023.csv")
+# ndti  <- fread("/projectnb/dietzelab/XinyuanJi/ndti_subsample_n=400_2018-2023.csv")
+# phenology <- fread("/projectnb/dietzelab/XinyuanJi/chosen_pairs_subsample_n=400_2018-2023.csv")
 
 tillage_metrics <- function(ndti_table, phenology_table) {
   
@@ -22,15 +22,15 @@ tillage_metrics <- function(ndti_table, phenology_table) {
   }
   
   pheno_date <- phenology_table %>%
-    transmute(parcel_id, year, season,
-              OGI_date  = convert_julian(mslsp_OGI, year),
-              OGMn_date = convert_julian(mslsp_OGMn, year))
+    transmute(parcel_id, year, OGI_date, OGMn_date)
+              # OGI_date  = convert_julian(OGI, year),
+              # OGMn_date = convert_julian(OGMn, year))
   
   # 2. Smooth NDTI
   ndti_smooth <- ndti_work %>%
     inner_join(pheno_date, by = c("parcel_id", "year")) %>%
     arrange(parcel_id, date) %>%
-    group_by(parcel_id, year, PFT, season) %>%
+    group_by(parcel_id, year, PFT) %>%
     complete(date = seq.Date(min(date), max(date), by = "day")) %>%
     fill(OGMn_date, OGI_date, .direction = "downup") %>% 
     mutate(
@@ -59,7 +59,7 @@ tillage_metrics <- function(ndti_table, phenology_table) {
       maxNDTI_pre_date = date[max_pre_idx],
       maxNDTI_pre_min  = smoothed[max_pre_idx],
       ndti_pct_change  = ((maxNDTI_pre_min - ndti_on_minNDTI) / maxNDTI_pre_min) * 100,
-      year = first(year.y), PFT = first(PFT), season = first(season.y),
+      year = first(year.y), PFT = first(PFT),
       OGMn_date = first(fallow_start),
       .groups = "drop"
     )
@@ -124,20 +124,22 @@ tillage_metrics <- function(ndti_table, phenology_table) {
     unnest_wider(res_max, names_sep = "_") %>%
     unnest_wider(res_min, names_sep = "_") %>%
     select(
-      parcel_id, year, PFT, season,
-      OGMn_date,
-      # Max NDTI
-      max_date = maxNDTI_pre_date, max_ndti = maxNDTI_pre_min, 
-      max_n_valid = res_max_n_total, max_sd = res_max_sd,
-      # Min NDTI
-      min_date = minNDTI_date, min_ndti = ndti_on_minNDTI, 
-      min_n_valid = res_min_n_total, min_sd = res_min_sd,
+      parcel_id, year, PFT, OGMn_date,
+      
+      # Keep ONLY these for Max
+      max_date = maxNDTI_pre_date, 
+      max_ndti = maxNDTI_pre_min, 
+      
+      # Keep everything for Min (as per your previous setup)
+      min_date = minNDTI_date, 
+      min_ndti = ndti_on_minNDTI, 
+      min_n_valid = res_min_n_total, 
+      min_sd = res_min_sd,
+      
       # Pct Change
       ndti_pct_change,
-      # Validation Max
-      max_val_date_before = res_max_d_before, max_val_n_before = res_max_n_before,
-      max_val_date_after  = res_max_d_after,  max_val_n_after  = res_max_n_after,
-      # Validation Min
+      
+      # Keep validation for Min, but skip them for Max
       min_val_date_before = res_min_d_before, min_val_n_before = res_min_n_before,
       min_val_date_after  = res_min_d_after,  min_val_n_after  = res_min_n_after
     )
@@ -148,83 +150,58 @@ tillage_metrics <- function(ndti_table, phenology_table) {
 
 
 
-# # Load all final statewide outputs
-# ndti_files  <- Sys.glob("/projectnb/dietzelab/ccmmf/management/tillage/ndti_by_parcel_id_v3/year=*/ndti_year=*_month=*.parquet")
-# mslsp_files <- Sys.glob("/projectnb/dietzelab/ccmmf/management/phenology/raw_mslsp_v4.1/year=*/mslsp_year=*.parquet")
-# 
-# ndti  <- rbindlist(lapply(ndti_files, read_parquet),  use.names = TRUE, fill = TRUE)
-# mslsp <- rbindlist(lapply(mslsp_files, read_parquet), use.names = TRUE, fill = TRUE)
-# 
-# colnames(ndti)
-# 
-# 
-# 
-# ndti[,  parcel_id := as.character(parcel_id)]
-# mslsp[, parcel_id := as.character(parcel_id)]
-# 
-# # keep only parcels present in both
-# common_ids <- intersect(unique(ndti$parcel_id), unique(mslsp$parcel_id))
-# ndti  <- ndti[parcel_id %in% common_ids]
-# mslsp <- mslsp[parcel_id %in% common_ids]
-# 
-# # NDTI as monthly time series
-# ndti[, date := as.Date(date)]
-# setorder(ndti, parcel_id, date)
-# 
-# # MSLSP cycle timing (DOY -> Date)
-# mslsp <- mslsp[, .(
-#   parcel_id,
-#   PFT,
-#   year,
-#   cycle,                # MSLSP cycle (1/2)
-#   OGI  = OGI_mean,
-#   OGMn = OGMn_mean
-# )]
-# 
-# mslsp[, OGI_date  := as.Date(pmax(1, pmin(366, round(OGI)))  - 1L, origin = paste0(year, "-01-01"))]
-# mslsp[, OGMn_date := as.Date(pmax(1, pmin(366, round(OGMn))) - 1L, origin = paste0(year, "-01-01"))]
-# 
-# setorder(mslsp, parcel_id, year, cycle)
-# 
-# 
-# 
-# # 1. Get unique parcel-PFT pairs
-# # We assume 'PFT' exists in 'ndti'. If not, verify where PFT is stored.
-# parcel_pft_map <- unique(ndti[, .(parcel_id, PFT)])
-# 
-# # 2. Sample 10 from each target PFT
-# target_pfts <- c("woody", "row", "rice", "hay")
-# sampled_ids <- parcel_pft_map[PFT %in% target_pfts, .SD[sample(.N, min(.N, 10))], by = PFT]$parcel_id
-# 
-# # 3. Subset the tables
-# ndti_subset <- ndti[parcel_id %in% sampled_ids]
-# mslsp_subset <- mslsp[parcel_id %in% sampled_ids]
-# 
-# # Rename MSLSP columns to match function expectations
-# mslsp_formatted <- copy(mslsp_subset)
-# setnames(mslsp_formatted, 
-#          old = c("cycle", "OGI_date", "OGMn_date"), 
-#          new = c("season", "mslsp_OGI", "mslsp_OGMn"), 
-#          skip_absent = TRUE)
-# 
-# # Note: Your current tillage_metrics function expects 'mslsp_OGI' and 'mslsp_OGMn' 
-# # as inputs (which it then converts). If your data is already converted, 
-# # you might need to adjust the function slightly. 
-# # Based on your previous code, let's assume you pass the raw DOY columns.
-# 
-# # Run the analysis on the 40-parcel subset
-# results_subset <- tillage_metrics(ndti_subset, mslsp_formatted)
-# 
-# # View the result
-# head(results_subset)
+library(data.table)
+library(arrow)
+
+# Load all final statewide outputs
+ndti_files  <- Sys.glob("/projectnb/dietzelab/ccmmf/management/tillage/ndti_v4.1/year=*/ndti_year=*_month=*.parquet")
+mslsp_files <- Sys.glob("/projectnb/dietzelab/ccmmf/management/phenology/matched_landiq_mslsp_v4.1/assigned_year=2020.parquet")
+
+ndti  <- rbindlist(lapply(ndti_files, read_parquet),  use.names = TRUE, fill = TRUE)
+mslsp <- rbindlist(lapply(mslsp_files, read_parquet), use.names = TRUE, fill = TRUE)
+
+ndti[,  parcel_id := as.character(parcel_id)]
+mslsp[, parcel_id := as.character(parcel_id)]
+
+ndti <- ndti[year == 2020]
+mslsp <- mslsp[year == 2020]
+
+# keep only parcels present in both
+common_ids <- intersect(unique(ndti$parcel_id), unique(mslsp$parcel_id))
+ndti  <- ndti[parcel_id %in% common_ids]
+mslsp <- mslsp[parcel_id %in% common_ids]
+
+# NDTI as monthly time series
+ndti[, date := as.Date(date)]
+setorder(ndti, parcel_id, date)
+
+# MSLSP cycle timing (DOY -> Date)
+mslsp <- mslsp[, .(
+  parcel_id,
+  year,
+  cycle = mslsp_cycle,                # MSLSP cycle (1/2)
+  OGI  = mslsp_OGI,
+  OGMn = mslsp_OGMn,
+  PFT = landiq_PFT
+)]
+
+mslsp[, OGI_date  := as.Date(pmax(1, pmin(366, round(OGI)))  - 1L, origin = paste0(year, "-01-01"))]
+mslsp[, OGMn_date := as.Date(pmax(1, pmin(366, round(OGMn))) - 1L, origin = paste0(year, "-01-01"))]
+
+setorder(mslsp, parcel_id, year, cycle)
 
 
 
 
 
 # Testing
-example <- tillage_metrics(ndti,phenology)
+example <- tillage_metrics(ndti,mslsp)
 head(example)
+
+
+
+
+
 
 
 # Save the result
@@ -243,44 +220,20 @@ head(example)
 
 
 
-
-# OPTIONAL: plotting
-
-# # 1. Prepare data: Filter for the parcel and year
-# target_parcel <- 1149047
-# target_year   <- 2022
+# # Box Plot
 # 
-# annual_data <- ndti_smooth %>%
-#   filter(parcel_id == target_parcel, year == target_year)
+# # Create the plot object
+# clean_output <- example %>%
+#   filter(ndti_pct_change > -50, 
+#          ndti_pct_change < 200)
 # 
-# # 2. Get PFT for the title
-# plot_pft <- unique(annual_data$PFT)[1]
+# p <- ggplot(clean_output %>% filter(!is.na(ndti_pct_change)), 
+#             aes(x = ndti_pct_change, y = PFT, fill = PFT)) +
+#   geom_boxplot(outlier.alpha = 0.5) +
+# #   geom_jitter(width = 0.1, alpha = 0.2) +
+#   theme_minimal() +
+#   labs(title = "NDTI Pct Change vs PFT")
 # 
-# # 3. Get the specific dates for the vertical lines
-# # We filter the final_output for the relevant parcel and year
-# line_dates <- final_output %>%
-#   filter(parcel_id == target_parcel, year == target_year)
-# 
-# # 4. Create the plot
-# ggplot(annual_data, aes(x = date, y = smoothed)) +
-#   geom_line(color = "darkgreen", size = 1) +
-#   # Vertical line 1: OGMn date (Red)
-#   geom_vline(data = line_dates, aes(xintercept = OGMn_date),
-#              color = "red", linetype = "dashed", size = 0.8) +
-#   # Vertical line 2: Next OGI date (Green)
-#   # Note: You may need to join the fallow_end back to final_output
-#   # or pull from fallow_periods if 'next OGI' isn't explicitly in final_output
-#   geom_vline(data = line_dates, aes(xintercept = minNDTI_date),
-#              color = "blue", linetype = "dotted", size = 0.8) +
-#   # Vertical line 3: min_ndti date (Blue)
-#   labs(
-#     title = paste("Annual NDTI Profile", target_year, "PFT: ", plot_pft),
-#     subtitle = paste("Parcel_id =", target_parcel),
-#     x = "Date",
-#     y = "Smoothed NDTI"
-#   ) +
-#   theme_minimal()
-
-
-
+# # Force it to show up
+# print(p)
 
